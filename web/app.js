@@ -16,6 +16,10 @@ const state = {
   pollMs: 1000,
   pollTimer: null,
   polling: false,
+  streaming: false,
+  streamFps: 8,
+  streamScale: 0.5,
+  streamQuality: 60,
   screenObjectUrl: null,
   history: [],
   historyIndex: -1,
@@ -84,13 +88,14 @@ function unlock(token, device, persist) {
   $('#login').hidden = true;
   $('#app').hidden = false;
   renderDevice(device);
-  startPolling();
+  applyViewMode();
   pollHealth();
   setInterval(pollHealth, 5000);
 }
 
 function lock(reason) {
   stopPolling();
+  stopStream();
   stopLogcat();
   state.token = null;
   try { sessionStorage.removeItem(TOKEN_KEY); } catch (_) { /* ignore */ }
@@ -228,6 +233,47 @@ async function pollLoop() {
   }
 }
 
+function streamUrl() {
+  const p = new URLSearchParams({
+    token: state.token,
+    fps: String(state.streamFps),
+    scale: String(state.streamScale),
+    quality: String(state.streamQuality),
+  });
+  return `/api/stream/mjpeg?${p.toString()}`;
+}
+
+// MJPEG: the browser keeps one HTTP response open and repaints the <img> as each
+// frame arrives - a real stream over the same path as everything else.
+function startStream() {
+  stopPolling();
+  state.streaming = true;
+  setScreenOverlay(true, 'connecting live stream...');
+  const img = $('#screen');
+  img.onload = () => setScreenOverlay(false);
+  img.onerror = () => {
+    if (state.streaming) setScreenOverlay(true, 'stream interrupted; retrying...');
+  };
+  img.src = streamUrl();
+  $('#fps-label').textContent = `live @ ${state.streamFps}fps`;
+}
+
+function stopStream() {
+  state.streaming = false;
+  const img = $('#screen');
+  img.onload = null;
+  img.onerror = null;
+  // Point at a tiny transparent gif so the browser tears down the MJPEG socket.
+  img.src = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+}
+
+function applyViewMode() {
+  const value = $('#poll-interval').value;
+  if (value === 'stream') startStream();
+  else if (Number(value) === 0) { stopStream(); stopPolling(); $('#fps-label').textContent = 'paused'; }
+  else { stopStream(); state.pollMs = Number(value); startPolling(); }
+}
+
 function startPolling() {
   stopPolling();
   if (state.pollMs <= 0) { $('#fps-label').textContent = 'paused'; return; }
@@ -244,15 +290,22 @@ function stopPolling() {
 }
 
 $('#poll-interval').addEventListener('change', (event) => {
-  state.pollMs = Number(event.target.value);
+  const value = event.target.value;
+  if (value === 'stream') {
+    state.pollMs = -1;
+    startStream();
+    return;
+  }
+  stopStream();
+  state.pollMs = Number(value);
   if (state.pollMs === 0) { stopPolling(); $('#fps-label').textContent = 'paused'; }
   else startPolling();
 });
 
 document.addEventListener('visibilitychange', () => {
   if (!state.token) return;
-  if (document.hidden) stopPolling();
-  else if (state.pollMs > 0) startPolling();
+  if (document.hidden) { stopPolling(); stopStream(); }
+  else applyViewMode();
 });
 
 /* ─────────────────────── coordinate mapping + gestures ─────────────────────
@@ -325,7 +378,7 @@ screenEl.addEventListener('pointerup', async (event) => {
         }),
       });
     }
-    if (state.pollMs > 0) setTimeout(() => { grabFrame().catch(() => {}); }, 180);
+    if (state.pollMs > 0 && !state.streaming) setTimeout(() => { grabFrame().catch(() => {}); }, 180);
   } catch (e) {
     toast(e.message, 'err');
   }
@@ -342,7 +395,7 @@ async function sendKey(keycode) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ keycode }),
     });
-    if (state.pollMs > 0) setTimeout(() => { grabFrame().catch(() => {}); }, 180);
+    if (state.pollMs > 0 && !state.streaming) setTimeout(() => { grabFrame().catch(() => {}); }, 180);
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -362,7 +415,7 @@ $('#type-form').addEventListener('submit', async (event) => {
       body: JSON.stringify({ text }),
     });
     input.value = '';
-    if (state.pollMs > 0) setTimeout(() => { grabFrame().catch(() => {}); }, 250);
+    if (state.pollMs > 0 && !state.streaming) setTimeout(() => { grabFrame().catch(() => {}); }, 250);
   } catch (e) { toast(e.message, 'err'); }
 });
 
@@ -671,7 +724,7 @@ $('#btn-logcat').addEventListener('click', () => {
 
 $('#btn-logcat-clear').addEventListener('click', () => { logcatBox.textContent = ''; });
 
-window.addEventListener('beforeunload', () => { stopLogcat(); stopPolling(); });
+window.addEventListener('beforeunload', () => { stopLogcat(); stopPolling(); stopStream(); });
 
 /* ───────────────────────────── boot ───────────────────────────── */
 (async function init() {

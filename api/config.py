@@ -52,6 +52,16 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     return value
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:  # pragma: no cover - config error path
+        raise SystemExit(f"{name} must be a number, got {raw!r}") from exc
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -92,6 +102,12 @@ class Settings:
     logcat_max_lines: int = 5000
     web_dir: str = "/opt/app/web"
     screenshot_timeout: int = 30
+
+    # live MJPEG stream
+    stream_fps: int = 8
+    stream_max_fps: int = 30
+    stream_scale: float = 0.5
+    stream_quality: int = 60
 
     # file transfer / recording
     max_upload_mb: int = 2048
@@ -197,6 +213,10 @@ def load_settings() -> Settings:
         logcat_max_lines=_env_int("LOGCAT_MAX_LINES", 5000),
         web_dir=_env_str("WEB_DIR", "/opt/app/web"),
         screenshot_timeout=_env_int("SCREENSHOT_TIMEOUT", 30),
+        stream_fps=_env_int("STREAM_FPS", 8),
+        stream_max_fps=_env_int("STREAM_MAX_FPS", 30),
+        stream_quality=_env_int("STREAM_QUALITY", 60),
+        stream_scale=_env_float("STREAM_SCALE", 0.5),
         max_upload_mb=_env_int("MAX_UPLOAD_MB", 2048),
         max_pull_mb=_env_int("MAX_PULL_MB", 2048),
         transfer_timeout=_env_int("TRANSFER_TIMEOUT", 600),

@@ -242,6 +242,10 @@ Dokploy's simpler "Application" type.
 | `CAPTURE_FILE` | `…/captures/traffic.pcap` | Where the pcap is written. |
 | `MITM_ENABLED` | `false` | Enable HTTPS interception (layer 2); adds `-writable-system`. |
 | `MITM_PORT` | `8081` | In-container mitmproxy listen port. |
+| `STREAM_FPS` | `8` | Default MJPEG frame rate. |
+| `STREAM_MAX_FPS` | `30` | Hard cap on requested fps. |
+| `STREAM_SCALE` | `0.5` | Default downscale factor. |
+| `STREAM_QUALITY` | `60` | Default JPEG quality. |
 
 ¹ The library's own default is `allowlist` (safe for anyone importing it), but **this
 deployment's `docker-compose.yml` defaults `SHELL_MODE` to `unrestricted`**, as requested.
@@ -312,6 +316,7 @@ export AUTH="Authorization: Bearer $TOKEN"
 | `DELETE` | `/api/app/{package}` | ✔ | Uninstall a package |
 | `GET` | `/api/apps` | ✔ | List installed packages |
 | `GET` | `/api/screenshot` | ✔ | Raw PNG of the framebuffer |
+| `GET` | `/api/stream/mjpeg` | ✔ | Live MJPEG video stream of the screen |
 | `POST` | `/api/input/tap` | ✔ | Tap at `(x, y)` |
 | `POST` | `/api/input/swipe` | ✔ | Swipe `(x1,y1) → (x2,y2)` over `ms` |
 | `POST` | `/api/input/text` | ✔ | Type text into the focused field |
@@ -402,6 +407,27 @@ curl -s -H "$AUTH" "$BASE/api/apps?include_system=true"   # everything
 ```bash
 curl -s -H "$AUTH" $BASE/api/screenshot -o screen.png
 ```
+
+### Live video stream (MJPEG)
+
+A continuous `multipart/x-mixed-replace` feed — point an `<img>` straight at it, or
+open it in a browser. `?token=` is accepted because `<img>` cannot send a header.
+
+```html
+<img src="https://android.your-domain.com/api/stream/mjpeg?token=TOKEN&fps=10&scale=0.5&quality=60">
+```
+
+| Param | Default | Meaning |
+|---|---|---|
+| `fps` | `8` | Target frames per second (capped at `STREAM_MAX_FPS`). |
+| `scale` | `0.5` | Downscale factor; smaller frames stream faster. |
+| `quality` | `60` | JPEG quality 10–95. |
+
+The web console's **🔴 live** option in the *Poll* selector uses this. The real ceiling
+is `screencap` speed (~5–10 fps at full resolution) — this is a genuine live feed, not
+1-fps polling, but it is not 60 fps. True 60-fps low-latency video would need WebRTC
+(a signaling server + STUN/TURN + an H264/RTP pipeline), which is far more infrastructure
+than this single-container, Traefik-fronted deployment warrants.
 
 ### Input
 

@@ -314,6 +314,82 @@ async def uninstall(
 
 
 # --------------------------------------------------------------------------- #
+# live MJPEG stream
+# --------------------------------------------------------------------------- #
+def _encode_jpeg(png: bytes, scale: float, quality: int) -> bytes:
+    """Decode a screencap PNG and re-encode as a (usually downscaled) JPEG.
+
+    Smaller frames -> more frames per second over the wire. Done in a worker
+    thread so it never blocks the event loop.
+    """
+    from io import BytesIO
+
+    from PIL import Image
+
+    with Image.open(BytesIO(png)) as img:
+        img = img.convert("RGB")
+        if 0.0 < scale < 1.0:
+            img = img.resize(
+                (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                Image.BILINEAR,
+            )
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=quality)
+        return out.getvalue()
+
+
+@app.get("/api/stream/mjpeg", tags=["device"])
+async def stream_mjpeg(
+    request: Request,
+    _: StreamTokenDep,
+    fps: Annotated[int, Query(ge=1, le=60)] = settings.stream_fps,
+    scale: Annotated[float, Query(ge=0.1, le=1.0)] = settings.stream_scale,
+    quality: Annotated[int, Query(ge=10, le=95)] = settings.stream_quality,
+) -> StreamingResponse:
+    """Continuous MJPEG (multipart/x-mixed-replace) feed of the device screen.
+
+    Point an <img> straight at it. EventSource-style ?token= is accepted because
+    <img> cannot send an Authorization header. The frame rate is capped at
+    STREAM_MAX_FPS and is ultimately limited by how fast screencap can run.
+    """
+    fps = min(fps, settings.stream_max_fps)
+    interval = 1.0 / fps
+    boundary = "frame"
+
+    async def frames() -> AsyncIterator[bytes]:
+        loop = asyncio.get_event_loop()
+        while True:
+            if await request.is_disconnected():
+                break
+            started = loop.time()
+            try:
+                png = await run_in_threadpool(adb.screenshot_png)
+                jpeg = await run_in_threadpool(_encode_jpeg, png, scale, quality)
+            except adb.AdbError:
+                # Device momentarily unavailable (booting, rebooting) - pause and retry.
+                await asyncio.sleep(0.5)
+                continue
+            yield (
+                (
+                    f"--{boundary}\r\n"
+                    f"Content-Type: image/jpeg\r\n"
+                    f"Content-Length: {len(jpeg)}\r\n\r\n"
+                ).encode()
+                + jpeg
+                + b"\r\n"
+            )
+            elapsed = loop.time() - started
+            if elapsed < interval:
+                await asyncio.sleep(interval - elapsed)
+
+    return StreamingResponse(
+        frames(),
+        media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+# --------------------------------------------------------------------------- #
 # screenshot
 # --------------------------------------------------------------------------- #
 @app.get(
