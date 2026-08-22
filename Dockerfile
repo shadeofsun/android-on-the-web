@@ -54,6 +54,7 @@ RUN set -eux; \
         wget \
         unzip \
         gosu \
+        openssl \
         procps \
         socat \
         file \
@@ -160,14 +161,25 @@ RUN set -eux; \
     /opt/venv/bin/pip install --no-cache-dir -r /opt/app/api/requirements.txt
 ENV PATH="/opt/venv/bin:${PATH}"
 
+# mitmproxy (layer-2 HTTPS interception) in an isolated venv - its pinned deps
+# must not collide with the API venv. Only mitmdump is invoked at runtime.
+RUN set -eux; \
+    python3 -m venv /opt/mitmvenv; \
+    /opt/mitmvenv/bin/pip install --no-cache-dir --upgrade pip; \
+    /opt/mitmvenv/bin/pip install --no-cache-dir mitmproxy==11.0.0; \
+    ln -sf /opt/mitmvenv/bin/mitmdump /usr/local/bin/mitmdump
+
 COPY api/ /opt/app/api/
 COPY web/ /opt/app/web/
 COPY scripts/ /opt/app/scripts/
+COPY mitm/ /opt/app/mitm/
 
 RUN set -eux; \
     chmod +x /opt/app/scripts/*.sh; \
     chown -R "${APP_UID}:${APP_GID}" /opt/app "${AVD_TEMPLATE_DIR}"; \
-    mkdir -p "/home/${APP_USER}/.android/avd"; \
+    mkdir -p "/home/${APP_USER}/.android/avd" \
+             "/home/${APP_USER}/captures" \
+             "/home/${APP_USER}/mitm"; \
     chown -R "${APP_UID}:${APP_GID}" "/home/${APP_USER}"
 
 ENV APP_USER="${APP_USER}" \

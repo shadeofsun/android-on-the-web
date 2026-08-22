@@ -488,3 +488,145 @@ async def stream_logcat(*, filters: list[str], clear_first: bool = False) -> Asy
             process.kill()
             with contextlib.suppress(ProcessLookupError):
                 await process.wait()
+
+
+# --------------------------------------------------------------------------- #
+# file transfer, root, recording, port forwarding (adb-level, not shell)
+# --------------------------------------------------------------------------- #
+# These call adb subcommands directly with an argv list, so device-side paths
+# are passed as literal arguments - there is no shell to inject into, and no
+# path validation is imposed beyond "not empty". "Everything allowed" applies.
+def push_file(local_path: Path, device_path: str) -> AdbResult:
+    if not local_path.is_file():
+        raise InvalidArgumentError(f"local file not found: {local_path}")
+    if not device_path.strip():
+        raise InvalidArgumentError("device_path must not be empty")
+    return run(
+        ["push", str(local_path), device_path],
+        timeout=settings.transfer_timeout,
+        what="push",
+        check=True,
+    )
+
+
+def pull_file(device_path: str, local_path: Path) -> AdbResult:
+    if not device_path.strip():
+        raise InvalidArgumentError("device_path must not be empty")
+    result = run(
+        ["pull", device_path, str(local_path)],
+        timeout=settings.transfer_timeout,
+        what="pull",
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    if not local_path.exists() or "error:" in combined.lower():
+        raise AdbError(f"pull failed: {combined.strip() or 'file not retrieved'}")
+    return result
+
+
+def adb_root() -> AdbResult:
+    """Restart adbd as root. Works on -eng / google_apis images."""
+    result = run(["root"], timeout=30, what="adb root")
+    # adb root prints to stdout even on the no-op path; surface it as-is.
+    if "cannot run as root" in (result.stdout + result.stderr).lower():
+        raise AdbError(result.stdout.strip() or result.stderr.strip())
+    run(["wait-for-device"], timeout=60, what="wait-for-device")
+    return result
+
+
+def adb_unroot() -> AdbResult:
+    result = run(["unroot"], timeout=30, what="adb unroot")
+    run(["wait-for-device"], timeout=60, what="wait-for-device")
+    return result
+
+
+def adb_remount() -> AdbResult:
+    """Make /system and friends writable (needs root + -writable-system)."""
+    return run(["remount"], timeout=60, what="adb remount")
+
+
+def screenrecord(seconds: int, *, bit_rate_mbps: int | None = None) -> Path:
+    """Record the screen on the device, then pull the mp4 to a temp file.
+
+    Returns the local path; the caller is responsible for cleaning it up.
+    """
+    if not 1 <= seconds <= settings.screenrecord_max_seconds:
+        raise InvalidArgumentError(
+            f"seconds must be between 1 and {settings.screenrecord_max_seconds}"
+        )
+    import tempfile
+    import time as _time
+
+    remote = f"/sdcard/screenrecord-{int(_time.monotonic() * 1000)}.mp4"
+    argv = ["screenrecord", "--time-limit", str(seconds)]
+    if bit_rate_mbps is not None:
+        if not 1 <= bit_rate_mbps <= 200:
+            raise InvalidArgumentError("bit_rate_mbps must be between 1 and 200")
+        argv += ["--bit-rate", str(bit_rate_mbps * 1_000_000)]
+    argv.append(remote)
+
+    # screenrecord blocks for the whole duration; give it headroom.
+    shell_raw(argv, timeout=seconds + 30).raise_for_status("screenrecord")
+    # Flush to disk before pulling.
+    _time.sleep(1)
+
+    local = Path(tempfile.mkdtemp(prefix="rec-")) / "screenrecord.mp4"
+    try:
+        pull_file(remote, local)
+    finally:
+        run(["shell", "rm", "-f", remote], timeout=15, what="rm recording")
+    return local
+
+
+def list_forward() -> list[dict[str, str]]:
+    result = run(["forward", "--list"], timeout=15, what="forward --list")
+    entries: list[dict[str, str]] = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            entries.append({"serial": parts[0], "local": parts[1], "remote": parts[2]})
+    return entries
+
+
+def add_forward(local: str, remote: str) -> AdbResult:
+    _require_forward_spec(local=local, remote=remote)
+    return run(["forward", local, remote], timeout=15, what="forward", check=True)
+
+
+def remove_forward(local: str) -> AdbResult:
+    _require_forward_spec(local=local)
+    return run(["forward", "--remove", local], timeout=15, what="forward --remove", check=True)
+
+
+def list_reverse() -> list[dict[str, str]]:
+    result = run(["reverse", "--list"], timeout=15, what="reverse --list")
+    entries: list[dict[str, str]] = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            entries.append({"serial": parts[0], "remote": parts[1], "local": parts[2]})
+        elif len(parts) == 2:
+            entries.append({"remote": parts[0], "local": parts[1]})
+    return entries
+
+
+def add_reverse(remote: str, local: str) -> AdbResult:
+    _require_forward_spec(local=local, remote=remote)
+    return run(["reverse", remote, local], timeout=15, what="reverse", check=True)
+
+
+def remove_reverse(remote: str) -> AdbResult:
+    _require_forward_spec(remote=remote)
+    return run(["reverse", "--remove", remote], timeout=15, what="reverse --remove", check=True)
+
+
+_FORWARD_SPEC_RE = re.compile(
+    r"^(tcp:\d{1,5}|localabstract:[\w.\-]+|localreserved:[\w.\-]+|jdwp:\d+)$"
+)
+
+
+def _require_forward_spec(**specs: str) -> None:
+    for name, value in specs.items():
+        if not _FORWARD_SPEC_RE.match(value.strip()):
+            raise InvalidArgumentError(
+                f"{name} must be like 'tcp:8080' or 'localabstract:name', got {value!r}"
+            )

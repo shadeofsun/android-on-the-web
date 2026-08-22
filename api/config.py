@@ -93,6 +93,23 @@ class Settings:
     web_dir: str = "/opt/app/web"
     screenshot_timeout: int = 30
 
+    # file transfer / recording
+    max_upload_mb: int = 2048
+    max_pull_mb: int = 2048
+    transfer_timeout: int = 600
+    screenrecord_max_seconds: int = 180
+
+    # network capture (layer 1: raw packets, every protocol)
+    capture_traffic: bool = True
+    capture_dir: str = "/home/androiduser/captures"
+    capture_file: str = "/home/androiduser/captures/traffic.pcap"
+
+    # HTTPS interception (layer 2: decrypted HTTP, opt-in, best-effort)
+    mitm_enabled: bool = False
+    mitm_port: int = 8081
+    mitm_dir: str = "/home/androiduser/mitm"
+    mitm_binary: str = "mitmdump"
+
     allowed_binaries_set: frozenset[str] = field(init=False, default=frozenset())
 
     def __post_init__(self) -> None:
@@ -105,6 +122,22 @@ class Settings:
     @property
     def unrestricted_shell(self) -> bool:
         return self.shell_mode == SHELL_MODE_UNRESTRICTED
+
+    @property
+    def max_upload_bytes(self) -> int:
+        return self.max_upload_mb * 1024 * 1024
+
+    @property
+    def max_pull_bytes(self) -> int:
+        return self.max_pull_mb * 1024 * 1024
+
+    @property
+    def mitm_flows_file(self) -> str:
+        return f"{self.mitm_dir}/flows.jsonl"
+
+    @property
+    def mitm_ca_file(self) -> str:
+        return f"{self.mitm_dir}/mitmproxy-ca-cert.pem"
 
 
 def load_settings() -> Settings:
@@ -164,6 +197,17 @@ def load_settings() -> Settings:
         logcat_max_lines=_env_int("LOGCAT_MAX_LINES", 5000),
         web_dir=_env_str("WEB_DIR", "/opt/app/web"),
         screenshot_timeout=_env_int("SCREENSHOT_TIMEOUT", 30),
+        max_upload_mb=_env_int("MAX_UPLOAD_MB", 2048),
+        max_pull_mb=_env_int("MAX_PULL_MB", 2048),
+        transfer_timeout=_env_int("TRANSFER_TIMEOUT", 600),
+        screenrecord_max_seconds=_env_int("SCREENRECORD_MAX_SECONDS", 180),
+        capture_traffic=_env_bool("CAPTURE_TRAFFIC", True),
+        capture_dir=_env_str("CAPTURE_DIR", "/home/androiduser/captures"),
+        capture_file=_env_str("CAPTURE_FILE", "/home/androiduser/captures/traffic.pcap"),
+        mitm_enabled=_env_bool("MITM_ENABLED", False),
+        mitm_port=_env_int("MITM_PORT", 8081),
+        mitm_dir=_env_str("MITM_DIR", "/home/androiduser/mitm"),
+        mitm_binary=_env_str("MITM_BINARY", "mitmdump"),
     )
 
 

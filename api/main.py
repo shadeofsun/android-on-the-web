@@ -11,6 +11,7 @@ stall the event loop (and therefore the screenshot poll driving the UI).
 # `Annotated[..., Depends(...)]` parameter on a rate-limited route.
 
 import asyncio
+import json
 import logging
 import shutil
 import tempfile
@@ -23,6 +24,7 @@ from typing import Annotated, Any
 from fastapi import (
     FastAPI,
     File,
+    Form,
     HTTPException,
     Query,
     Request,
@@ -36,9 +38,10 @@ from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from api import adb
+from api import adb, mitm, network
 from api.auth import StreamTokenDep, TokenDep
 from api.config import settings
 
@@ -375,6 +378,33 @@ async def input_key(
 # --------------------------------------------------------------------------- #
 # logcat (SSE)
 # --------------------------------------------------------------------------- #
+def _shell_response(cmd: str, result: adb.AdbResult) -> "ShellResponse":
+    return ShellResponse(
+        cmd=cmd,
+        exit_code=result.exit_code,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        duration_ms=result.duration_ms,
+    )
+
+
+def _cleanup_task(directory: Path) -> BackgroundTask:
+    return BackgroundTask(shutil.rmtree, directory, ignore_errors=True)
+
+
+def _read_pcap_slice(full: bool) -> bytes:
+    """Return the pcap bytes; from the last-clear baseline unless full=True.
+
+    A byte offset inside a pcap is not a valid file start, so we prepend the
+    24-byte global header to the sliced records.
+    """
+    path = network.capture_path()
+    raw = path.read_bytes()
+    if full or network.state.baseline_offset <= 24:
+        return raw
+    return raw[:24] + raw[network.state.baseline_offset :]
+
+
 def _sse(data: str, *, event: str | None = None) -> str:
     lines = "".join(f"data: {line}\n" for line in data.splitlines() or [""])
     prefix = f"event: {event}\n" if event else ""
@@ -428,6 +458,381 @@ async def logcat(
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
+    )
+
+
+# --------------------------------------------------------------------------- #
+# exception handlers for the new modules
+# --------------------------------------------------------------------------- #
+@app.exception_handler(mitm.MitmError)
+async def _mitm_error_handler(request: Request, exc: mitm.MitmError) -> JSONResponse:
+    return JSONResponse(status_code=status.HTTP_502_BAD_GATEWAY, content={"detail": str(exc)})
+
+
+@app.exception_handler(network.CaptureError)
+async def _capture_error_handler(request: Request, exc: network.CaptureError) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"detail": str(exc)}
+    )
+
+
+# --------------------------------------------------------------------------- #
+# file transfer / root / recording (adb-level)
+# --------------------------------------------------------------------------- #
+class ForwardRequest(BaseModel):
+    local: str = Field(..., examples=["tcp:9000"])
+    remote: str = Field(..., examples=["tcp:9000"])
+
+
+class ReverseRequest(BaseModel):
+    remote: str = Field(..., examples=["tcp:9000"])
+    local: str = Field(..., examples=["tcp:9000"])
+
+
+@app.post("/api/push", response_model=SimpleResponse, tags=["files"])
+@limiter.limit("30/minute")
+async def push(
+    request: Request,
+    response: Response,
+    _: TokenDep,
+    file: Annotated[UploadFile, File(description="File to push to the device")],
+    dest: Annotated[str, Form(description="Absolute device path, e.g. /sdcard/x")],
+) -> SimpleResponse:
+    """Upload a file and `adb push` it to an arbitrary device path."""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="push-"))
+    tmp_path = tmp_dir / (Path(file.filename or "upload.bin").name)
+    written = 0
+    try:
+        with tmp_path.open("wb") as sink:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > settings.max_upload_bytes:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"Upload exceeds the {settings.max_upload_mb} MB limit.",
+                    )
+                sink.write(chunk)
+        await run_in_threadpool(adb.push_file, tmp_path, dest)
+        return SimpleResponse(detail=f"pushed {written} bytes to {dest}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@app.get("/api/pull", tags=["files"])
+@limiter.limit("30/minute")
+async def pull(
+    request: Request,
+    _: StreamTokenDep,
+    path: Annotated[str, Query(description="Absolute device path to retrieve")],
+) -> FileResponse:
+    """`adb pull` a file from the device and stream it back."""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pull-"))
+    local = tmp_dir / "pulled.bin"
+    await run_in_threadpool(adb.pull_file, path, local)
+    size = local.stat().st_size
+    if size > settings.max_pull_bytes:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File ({size} bytes) exceeds the {settings.max_pull_mb} MB limit.",
+        )
+    filename = Path(path).name or "pulled.bin"
+    return FileResponse(
+        local,
+        filename=filename,
+        media_type="application/octet-stream",
+        background=_cleanup_task(tmp_dir),
+    )
+
+
+@app.post("/api/root", response_model=ShellResponse, tags=["device"])
+@limiter.limit("10/minute")
+async def root(request: Request, response: Response, _: TokenDep) -> ShellResponse:
+    """Restart adbd as root (google_apis image)."""
+    result = await run_in_threadpool(adb.adb_root)
+    return _shell_response("adb root", result)
+
+
+@app.post("/api/remount", response_model=ShellResponse, tags=["device"])
+@limiter.limit("10/minute")
+async def remount(request: Request, response: Response, _: TokenDep) -> ShellResponse:
+    """Remount /system read-write (needs root + -writable-system)."""
+    result = await run_in_threadpool(adb.adb_remount)
+    return _shell_response("adb remount", result)
+
+
+@app.get("/api/screenrecord", tags=["device"])
+@limiter.limit("6/minute")
+async def screenrecord(
+    request: Request,
+    _: StreamTokenDep,
+    seconds: Annotated[int, Query(ge=1, le=180)] = 10,
+    bitrate_mbps: Annotated[int | None, Query(ge=1, le=200)] = None,
+) -> FileResponse:
+    """Record the screen for `seconds` and return the mp4."""
+    local = await run_in_threadpool(adb.screenrecord, seconds, bit_rate_mbps=bitrate_mbps)
+    return FileResponse(
+        local,
+        filename="screenrecord.mp4",
+        media_type="video/mp4",
+        background=_cleanup_task(local.parent),
+    )
+
+
+@app.get("/api/forward", tags=["device"])
+@limiter.limit(settings.rate_limit)
+async def forward_list(request: Request, response: Response, _: TokenDep) -> dict[str, Any]:
+    """List adb port forwards. Note: only useful if the port is also published."""
+    return {"forwards": await run_in_threadpool(adb.list_forward)}
+
+
+@app.post("/api/forward", response_model=SimpleResponse, tags=["device"])
+@limiter.limit(settings.rate_limit)
+async def forward_add(
+    request: Request, response: Response, body: ForwardRequest, _: TokenDep
+) -> SimpleResponse:
+    await run_in_threadpool(adb.add_forward, body.local, body.remote)
+    return SimpleResponse(detail=f"forward {body.local} -> {body.remote}")
+
+
+@app.delete("/api/forward", response_model=SimpleResponse, tags=["device"])
+@limiter.limit(settings.rate_limit)
+async def forward_remove(
+    request: Request,
+    response: Response,
+    _: TokenDep,
+    local: Annotated[str, Query(description="Local spec to remove, e.g. tcp:9000")],
+) -> SimpleResponse:
+    await run_in_threadpool(adb.remove_forward, local)
+    return SimpleResponse(detail=f"removed forward {local}")
+
+
+@app.get("/api/reverse", tags=["device"])
+@limiter.limit(settings.rate_limit)
+async def reverse_list(request: Request, response: Response, _: TokenDep) -> dict[str, Any]:
+    return {"reverses": await run_in_threadpool(adb.list_reverse)}
+
+
+@app.post("/api/reverse", response_model=SimpleResponse, tags=["device"])
+@limiter.limit(settings.rate_limit)
+async def reverse_add(
+    request: Request, response: Response, body: ReverseRequest, _: TokenDep
+) -> SimpleResponse:
+    await run_in_threadpool(adb.add_reverse, body.remote, body.local)
+    return SimpleResponse(detail=f"reverse {body.remote} -> {body.local}")
+
+
+@app.delete("/api/reverse", response_model=SimpleResponse, tags=["device"])
+@limiter.limit(settings.rate_limit)
+async def reverse_remove(
+    request: Request,
+    response: Response,
+    _: TokenDep,
+    remote: Annotated[str, Query(description="Remote spec to remove, e.g. tcp:9000")],
+) -> SimpleResponse:
+    await run_in_threadpool(adb.remove_reverse, remote)
+    return SimpleResponse(detail=f"removed reverse {remote}")
+
+
+# --------------------------------------------------------------------------- #
+# network capture - layer 1 (raw packets, every protocol)
+# --------------------------------------------------------------------------- #
+def _packet_matches(
+    packet: network.Packet, proto: str | None, host: str | None, port: int | None
+) -> bool:
+    if proto and packet.protocol.upper() != proto.upper():
+        return False
+    if host and host not in (packet.src, packet.dst):
+        return False
+    if port is not None and port not in (packet.src_port, packet.dst_port):
+        return False
+    return True
+
+
+@app.get("/api/network/status", tags=["network"])
+@limiter.limit(settings.rate_limit)
+async def network_status(request: Request, response: Response, _: TokenDep) -> dict[str, Any]:
+    """Whether capture is on, the pcap size, and how much has been seen."""
+    return {
+        "capture_enabled": settings.capture_traffic,
+        "capture_file": settings.capture_file,
+        "file_size_bytes": network.capture_size(),
+        "available": network.capture_available(),
+        "baseline_offset": network.state.baseline_offset,
+    }
+
+
+@app.get("/api/network/packets", tags=["network"])
+@limiter.limit("120/minute")
+async def network_packets(
+    request: Request,
+    response: Response,
+    _: TokenDep,
+    limit: Annotated[int, Query(ge=1, le=5000)] = 200,
+    proto: Annotated[str | None, Query(description="TCP/UDP/DNS/HTTP/TLS/ICMP...")] = None,
+    host: Annotated[str | None, Query(description="Match src or dst IP")] = None,
+    port: Annotated[int | None, Query(ge=0, le=65535)] = None,
+) -> dict[str, Any]:
+    """Structured view of recent packets, newest last, with simple filters."""
+    if not network.capture_available():
+        raise network.CaptureError("no capture file yet (is CAPTURE_TRAFFIC enabled?)")
+    cursor = network.PcapCursor(
+        offset=network.state.baseline_offset, index=network.state.baseline_index
+    )
+    packets = await run_in_threadpool(network.read_new_packets, cursor)
+    filtered = [p.as_dict() for p in packets if _packet_matches(p, proto, host, port)]
+    return {"count": len(filtered), "packets": filtered[-limit:]}
+
+
+@app.get("/api/network/stats", tags=["network"])
+@limiter.limit("60/minute")
+async def network_stats(request: Request, response: Response, _: TokenDep) -> dict[str, Any]:
+    """Aggregate totals: packets/bytes per protocol and per host (top talkers)."""
+    if not network.capture_available():
+        raise network.CaptureError("no capture file yet (is CAPTURE_TRAFFIC enabled?)")
+    cursor = network.PcapCursor(
+        offset=network.state.baseline_offset, index=network.state.baseline_index
+    )
+    packets = await run_in_threadpool(network.read_new_packets, cursor)
+    by_proto: dict[str, dict[str, int]] = {}
+    by_host: dict[str, dict[str, int]] = {}
+    total_bytes = 0
+    for p in packets:
+        total_bytes += p.length
+        bp = by_proto.setdefault(p.protocol, {"packets": 0, "bytes": 0})
+        bp["packets"] += 1
+        bp["bytes"] += p.length
+        for endpoint in (p.src, p.dst):
+            if not endpoint:
+                continue
+            bh = by_host.setdefault(endpoint, {"packets": 0, "bytes": 0})
+            bh["packets"] += 1
+            bh["bytes"] += p.length
+    top_hosts = dict(sorted(by_host.items(), key=lambda kv: kv[1]["bytes"], reverse=True)[:20])
+    return {
+        "total_packets": len(packets),
+        "total_bytes": total_bytes,
+        "by_protocol": by_proto,
+        "top_hosts": top_hosts,
+    }
+
+
+@app.get("/api/network/stream", tags=["network"])
+async def network_stream(
+    request: Request,
+    _: StreamTokenDep,
+    proto: Annotated[str | None, Query()] = None,
+    host: Annotated[str | None, Query()] = None,
+    port: Annotated[int | None, Query(ge=0, le=65535)] = None,
+) -> StreamingResponse:
+    """Live packet feed as Server-Sent Events (polls the growing pcap)."""
+    cursor = network.PcapCursor()
+    await run_in_threadpool(network.read_new_packets, cursor)
+
+    async def event_stream() -> AsyncIterator[str]:
+        yield _sse("connected", event="status")
+        while True:
+            if await request.is_disconnected():
+                break
+            packets = await run_in_threadpool(network.read_new_packets, cursor, limit=500)
+            for packet in packets:
+                if _packet_matches(packet, proto, host, port):
+                    yield _sse(json.dumps(packet.as_dict()))
+            await asyncio.sleep(1.0)
+        yield _sse("closed", event="status")
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/network/pcap", tags=["network"])
+@limiter.limit("30/minute")
+async def network_pcap(
+    request: Request,
+    _: StreamTokenDep,
+    full: Annotated[bool, Query(description="Ignore the last clear, return everything")] = False,
+) -> Response:
+    """Download the raw pcap (open in Wireshark). Honours the last clear unless full."""
+    path = network.capture_path()
+    if not path.is_file():
+        raise network.CaptureError("no capture file yet")
+    data = await run_in_threadpool(_read_pcap_slice, full)
+    return Response(
+        content=data,
+        media_type="application/vnd.tcpdump.pcap",
+        headers={
+            "Content-Disposition": 'attachment; filename="capture.pcap"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/api/network/clear", response_model=SimpleResponse, tags=["network"])
+@limiter.limit(settings.rate_limit)
+async def network_clear(request: Request, response: Response, _: TokenDep) -> SimpleResponse:
+    """Move the baseline to 'now' so subsequent reads start fresh."""
+    cursor = network.PcapCursor()
+    await run_in_threadpool(network.read_new_packets, cursor)
+    network.state.baseline_offset = cursor.offset
+    network.state.baseline_index = cursor.index
+    return SimpleResponse(detail=f"baseline moved to offset {cursor.offset}")
+
+
+# --------------------------------------------------------------------------- #
+# network capture - layer 2 (mitmproxy, decrypted HTTP, opt-in best-effort)
+# --------------------------------------------------------------------------- #
+@app.get("/api/network/mitm/status", tags=["network"])
+@limiter.limit(settings.rate_limit)
+async def mitm_status(request: Request, response: Response, _: TokenDep) -> dict[str, Any]:
+    return await run_in_threadpool(mitm.status)
+
+
+@app.post("/api/network/mitm/start", tags=["network"])
+@limiter.limit("6/minute")
+async def mitm_start(request: Request, response: Response, _: TokenDep) -> dict[str, Any]:
+    """Start mitmdump, install its CA into the system store, set the device proxy."""
+    return await run_in_threadpool(mitm.start)
+
+
+@app.post("/api/network/mitm/stop", tags=["network"])
+@limiter.limit("6/minute")
+async def mitm_stop(request: Request, response: Response, _: TokenDep) -> dict[str, Any]:
+    return await run_in_threadpool(mitm.stop)
+
+
+@app.get("/api/network/mitm/flows", tags=["network"])
+@limiter.limit("120/minute")
+async def mitm_flows(
+    request: Request,
+    response: Response,
+    _: TokenDep,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, Any]:
+    """Decrypted HTTP(S) request/response flows captured by mitmproxy."""
+    flows = await run_in_threadpool(mitm.read_flows, limit=limit, offset=offset)
+    return {"count": len(flows), "flows": flows}
+
+
+@app.post("/api/network/mitm/clear", response_model=SimpleResponse, tags=["network"])
+@limiter.limit(settings.rate_limit)
+async def mitm_clear(request: Request, response: Response, _: TokenDep) -> SimpleResponse:
+    await run_in_threadpool(mitm.clear_flows)
+    return SimpleResponse(detail="mitm flows cleared")
+
+
+@app.get("/api/network/mitm/ca", tags=["network"])
+@limiter.limit(settings.rate_limit)
+async def mitm_ca(request: Request, _: StreamTokenDep) -> Response:
+    """Download the mitmproxy CA certificate (PEM)."""
+    pem = await run_in_threadpool(mitm.ca_pem)
+    return Response(
+        content=pem,
+        media_type="application/x-pem-file",
+        headers={"Content-Disposition": 'attachment; filename="mitmproxy-ca.pem"'},
     )
 
 

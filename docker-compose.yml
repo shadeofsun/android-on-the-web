@@ -38,6 +38,9 @@ services:
       # Persist userdata so installed apps survive a redeploy.
       # The image seeds this from /opt/avd-template on first start.
       - avd-data:/home/androiduser/.android/avd/pixel6.avd
+      # pcap captures + mitm CA/flows persist across redeploys
+      - capture-data:/home/androiduser/captures
+      - mitm-data:/home/androiduser/mitm
 
     environment:
       # --- required -------------------------------------------------------
@@ -49,11 +52,18 @@ services:
       - WIPE_DATA=${WIPE_DATA:-false}
       - DISABLE_ANIMATIONS=${DISABLE_ANIMATIONS:-true}
       # --- API ------------------------------------------------------------
-      - SHELL_MODE=${SHELL_MODE:-allowlist}
+      - SHELL_MODE=${SHELL_MODE:-unrestricted}
       - SHELL_TIMEOUT=${SHELL_TIMEOUT:-30}
       - MAX_APK_MB=${MAX_APK_MB:-200}
       - RATE_LIMIT=${RATE_LIMIT:-60/minute}
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      # --- traffic monitoring --------------------------------------------
+      - CAPTURE_TRAFFIC=${CAPTURE_TRAFFIC:-true}
+      - MITM_ENABLED=${MITM_ENABLED:-false}
+      - MITM_PORT=${MITM_PORT:-8081}
+      # --- file transfer -------------------------------------------------
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-2048}
+      - MAX_PULL_MB=${MAX_PULL_MB:-2048}
 
     # QEMU wants a decent /dev/shm; the default 64 MB causes hard-to-debug
     # graphics stalls.
@@ -126,6 +136,8 @@ services:
 
 volumes:
   avd-data:
+  capture-data:
+  mitm-data:
 
 networks:
   dokploy-network:

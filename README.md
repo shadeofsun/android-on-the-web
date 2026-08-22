@@ -21,6 +21,7 @@ through and **`--privileged` never required**.
 - [Deploying on Dokploy](#deploying-on-dokploy)
 - [Environment variables](#environment-variables)
 - [API reference](#api-reference)
+- [Traffic monitoring](#traffic-monitoring)
 - [Web console](#web-console)
 - [Security](#security)
 - [How it is built](#how-it-is-built)
@@ -231,10 +232,20 @@ Dokploy's simpler "Application" type.
 | `WIPE_DATA` | `false` | `true` adds `-wipe-data`, resetting userdata at every start. |
 | `DISABLE_ANIMATIONS` | `true` | Zero the window/transition/animator scales after boot. |
 | `EMULATOR_EXTRA_ARGS` | *(empty)* | Extra emulator flags, space-separated (e.g. `-writable-system`). |
-| `SHELL_MODE` | `allowlist` | `allowlist` or `unrestricted`. See [Security](#security). |
-| `SHELL_ALLOWED_BINARIES` | see below | Comma-separated override of the permitted first binary. |
+| `SHELL_MODE` | `unrestricted`¹ | `unrestricted` (any command) or `allowlist`. See [Security](#security). |
+| `SHELL_ALLOWED_BINARIES` | see below | In allowlist mode, the permitted first binaries. |
 | `SHELL_TIMEOUT` | `30` | Per-command timeout in seconds for `/api/shell`. |
 | `MAX_APK_MB` | `200` | Upload cap for `/api/install`. |
+| `MAX_UPLOAD_MB` | `2048` | Upload cap for `/api/push`. |
+| `MAX_PULL_MB` | `2048` | Download cap for `/api/pull`. |
+| `CAPTURE_TRAFFIC` | `true` | Capture all packets to a pcap (layer 1). |
+| `CAPTURE_FILE` | `…/captures/traffic.pcap` | Where the pcap is written. |
+| `MITM_ENABLED` | `false` | Enable HTTPS interception (layer 2); adds `-writable-system`. |
+| `MITM_PORT` | `8081` | In-container mitmproxy listen port. |
+
+¹ The library's own default is `allowlist` (safe for anyone importing it), but **this
+deployment's `docker-compose.yml` defaults `SHELL_MODE` to `unrestricted`**, as requested.
+Set `SHELL_MODE=allowlist` in the environment to re-enable the guardrails.
 | `INSTALL_TIMEOUT` | `300` | Timeout for `adb install` in seconds. |
 | `RATE_LIMIT` | `60/minute` | Per-IP limit (slowapi syntax). Input and screenshot routes use higher dedicated limits. |
 | `RATE_LIMIT_ENABLED` | `true` | Set `false` only on a private network. |
@@ -307,6 +318,20 @@ export AUTH="Authorization: Bearer $TOKEN"
 | `POST` | `/api/input/key` | ✔ | Send a keycode |
 | `GET` | `/api/logcat` | ✔ | Live logcat as Server-Sent Events |
 | `POST` | `/api/reboot` | ✔ | Reboot the device |
+| `POST` | `/api/root` | ✔ | Restart adbd as root |
+| `POST` | `/api/remount` | ✔ | Remount /system read-write |
+| `POST` | `/api/push` | ✔ | Upload a file to any device path |
+| `GET` | `/api/pull` | ✔ | Download a file from the device |
+| `GET` | `/api/screenrecord` | ✔ | Record the screen, return mp4 |
+| `GET`/`POST`/`DELETE` | `/api/forward` | ✔ | adb port forwards |
+| `GET`/`POST`/`DELETE` | `/api/reverse` | ✔ | adb reverse forwards |
+| `GET` | `/api/network/status` | ✔ | Capture state and pcap size |
+| `GET` | `/api/network/packets` | ✔ | Decoded packets (filterable) |
+| `GET` | `/api/network/stats` | ✔ | Per-protocol / per-host totals |
+| `GET` | `/api/network/stream` | ✔ | Live packet feed (SSE) |
+| `GET` | `/api/network/pcap` | ✔ | Download raw pcap (Wireshark) |
+| `POST` | `/api/network/clear` | ✔ | Reset the capture baseline |
+| `GET`/`POST` | `/api/network/mitm/*` | ✔ | HTTPS interception (opt-in) |
 
 ### Health
 
@@ -433,6 +458,102 @@ curl -s -X POST -H "$AUTH" $BASE/api/reboot
 | `503` | adb binary missing / device not attached |
 | `504` | Command exceeded its timeout |
 
+### Files, root and recording
+
+```bash
+# push a file to any device path
+curl -s -H "$AUTH" -F "file=@local.bin" -F "dest=/sdcard/local.bin" $BASE/api/push
+
+# pull a file back
+curl -s -H "$AUTH" "$BASE/api/pull?path=/sdcard/local.bin" -o local.bin
+
+# restart adbd as root, then make /system writable
+curl -s -X POST -H "$AUTH" $BASE/api/root
+curl -s -X POST -H "$AUTH" $BASE/api/remount
+
+# record 15 s of screen to mp4
+curl -s -H "$AUTH" "$BASE/api/screenrecord?seconds=15" -o rec.mp4
+
+# port forwards (only reachable if the port is also published on the host)
+curl -s -H "$AUTH" -H "$JSON" -d '{"local":"tcp:9000","remote":"tcp:9000"}' $BASE/api/forward
+curl -s -H "$AUTH" $BASE/api/forward
+```
+
+`push`/`pull` take literal device paths as argv (no shell), so any path works and
+nothing can be injected. `root`/`remount` work on the `google_apis` image; they are
+what layer-2 HTTPS interception relies on.
+
+---
+
+## Traffic monitoring
+
+Two layers, because "all traffic" means two different things.
+
+### Layer 1 — every packet (always on)
+
+The emulator is launched with `-tcpdump`, so **every packet of every protocol** — TCP,
+UDP, DNS, ICMP, QUIC, ARP, IPv6 — is written to a pcap that the API reads. This is
+comprehensive at the network level; TLS payloads are encrypted (see layer 2 for
+plaintext). Controlled by `CAPTURE_TRAFFIC` (default `true`).
+
+```bash
+# is capture on, and how big is the pcap?
+curl -s -H "$AUTH" $BASE/api/network/status
+
+# recent decoded packets, newest last
+curl -s -H "$AUTH" "$BASE/api/network/packets?limit=100"
+
+# filter by protocol / host / port
+curl -s -H "$AUTH" "$BASE/api/network/packets?proto=DNS"
+curl -s -H "$AUTH" "$BASE/api/network/packets?host=8.8.8.8"
+curl -s -H "$AUTH" "$BASE/api/network/packets?port=443"
+
+# aggregate totals: per-protocol and top talkers
+curl -s -H "$AUTH" $BASE/api/network/stats
+
+# LIVE feed (Server-Sent Events); ?token= works for EventSource
+curl -N -H "$AUTH" "$BASE/api/network/stream?proto=TLS"
+
+# download the raw pcap and open it in Wireshark
+curl -s -H "$AUTH" $BASE/api/network/pcap -o capture.pcap
+
+# reset the baseline so /packets and /pcap start fresh from now
+curl -s -X POST -H "$AUTH" $BASE/api/network/clear
+```
+
+Each packet is decoded to `{timestamp, l3, protocol, src, dst, src_port, dst_port,
+length, info}`. The pcap grows for the whole emulator session; `/api/network/clear`
+moves a baseline (it cannot truncate a file the emulator holds open), and
+`/api/network/pcap?full=true` ignores that baseline.
+
+### Layer 2 — decrypted HTTPS (mitmproxy, opt-in)
+
+To see **plaintext request/response bodies** rather than encrypted TLS, enable
+mitmproxy. Set `MITM_ENABLED=true` (this launches the emulator with `-writable-system`),
+redeploy, then:
+
+```bash
+# start the proxy: installs the mitm CA into the system trust store and points
+# the device's global proxy at it
+curl -s -X POST -H "$AUTH" $BASE/api/network/mitm/start
+
+# decrypted flows: method, url, status, headers, request/response bodies
+curl -s -H "$AUTH" "$BASE/api/network/mitm/flows?limit=50"
+
+# the CA (e.g. to trust it elsewhere)
+curl -s -H "$AUTH" $BASE/api/network/mitm/ca -o mitmproxy-ca.pem
+
+curl -s -X POST -H "$AUTH" $BASE/api/network/mitm/stop
+```
+
+> **Honest limitations.** This is best-effort. Installing the CA needs `adb root` +
+> `-writable-system`, which the `google_apis` image supports but the Play-Store image
+> does not. Apps that **pin** their certificates (many banking / anti-fraud SDKs) will
+> refuse to connect through the proxy — that is the app defending itself, not a bug. And
+> unlike layer 1, this device-side path has not been exercised against a live emulator in
+> testing; treat your first run as a smoke test. Layer 1 still captures those apps'
+> traffic at the packet level regardless.
+
 ---
 
 ## Web console
@@ -485,7 +606,14 @@ ssh -L 5555:127.0.0.1:5555 user@server
 adb connect 127.0.0.1:5555
 ```
 
-**`/api/shell` uses an allowlist, not a blocklist.**
+> **This deployment ships with `SHELL_MODE=unrestricted` and traffic capture on, by
+> request.** `/api/shell` runs any command, `/api/root` + `/api/remount` are available,
+> and every packet is recorded to a pcap. Anyone holding `API_TOKEN` therefore has full
+> control of the device and a copy of its network traffic. On a public domain like this,
+> put an IP-allowlist or BasicAuth middleware in front of Traefik, and treat `API_TOKEN`
+> as a root credential. To restore the guardrails, set `SHELL_MODE=allowlist`.
+
+**Allowlist mode (`SHELL_MODE=allowlist`) is a whitelist, not a blocklist.**
 
 - Only the *first* binary is checked, against `SHELL_ALLOWED_BINARIES`.
 - `;`, `&`, `|`, `` ` ``, `$(`, `${`, `>`, `<`, `\`, newline and carriage return are
@@ -534,7 +662,10 @@ scripts/check-kvm.sh    fails with a diagnostic wall of text if KVM is unusable
 scripts/wait-for-boot.sh adb wait-for-device + sys.boot_completed polling with progress
 api/config.py           env → frozen Settings, fail-fast validation
 api/auth.py             HTTPBearer + secrets.compare_digest
-api/adb.py              every adb call; typed exceptions; shell allowlist policy
+api/adb.py              every adb call; shell policy; push/pull/root/record/forward
+api/network.py          pure-Python incremental pcap parser (layer-1 capture)
+api/mitm.py             mitmproxy lifecycle + CA install (layer-2 HTTPS)
+mitm/addon.py           mitmdump addon: one JSON line per flow
 api/main.py             FastAPI routes, rate limits, SSE, static UI mount
 web/                    vanilla HTML/CSS/JS console
 ```

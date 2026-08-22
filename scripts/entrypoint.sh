@@ -23,6 +23,11 @@ EMULATOR_CORES="${EMULATOR_CORES:-4}"
 EMULATOR_EXTRA_ARGS="${EMULATOR_EXTRA_ARGS:-}"
 WIPE_DATA="${WIPE_DATA:-false}"
 DISABLE_ANIMATIONS="${DISABLE_ANIMATIONS:-true}"
+CAPTURE_TRAFFIC="${CAPTURE_TRAFFIC:-true}"
+CAPTURE_DIR="${CAPTURE_DIR:-${APP_HOME}/captures}"
+CAPTURE_FILE="${CAPTURE_FILE:-${CAPTURE_DIR}/traffic.pcap}"
+MITM_ENABLED="${MITM_ENABLED:-false}"
+MITM_DIR="${MITM_DIR:-${APP_HOME}/mitm}"
 APP_DIR="${APP_DIR:-/opt/app}"
 API_HOST="${API_HOST:-0.0.0.0}"
 API_PORT="${API_PORT:-8080}"
@@ -173,6 +178,23 @@ emu_args=(
     -camera-back none
     -camera-front none
 )
+
+# Layer-1 capture: the emulator dumps EVERY packet to a pcap. This is the
+# comprehensive "all traffic, every protocol" source the API reads.
+if [[ "${CAPTURE_TRAFFIC,,}" == "true" ]]; then
+    mkdir -p "${CAPTURE_DIR}"
+    : > "${CAPTURE_FILE}" || true
+    log "network capture enabled -> ${CAPTURE_FILE}"
+    emu_args+=(-tcpdump "${CAPTURE_FILE}")
+fi
+
+# Layer-2 (mitmproxy) needs a writable system partition to install its CA into
+# the system trust store. Only pay that cost when interception is requested.
+if [[ "${MITM_ENABLED,,}" == "true" ]]; then
+    mkdir -p "${MITM_DIR}"
+    log "MITM_ENABLED=true -> launching with -writable-system for CA install"
+    emu_args+=(-writable-system)
+fi
 
 if [[ "${WIPE_DATA,,}" == "true" ]]; then
     log "WIPE_DATA=true -> the userdata partition will be reset."
