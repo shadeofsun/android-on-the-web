@@ -26,6 +26,13 @@
 
 * { box-sizing: border-box; }
 
+/* The browser's `[hidden] { display: none }` lives in the UA stylesheet, and
+   ANY author `display` declaration outranks it regardless of specificity. Without
+   this rule, `el.hidden = true` silently does nothing on .login-shade,
+   .screen-overlay and .progress - the login overlay would stay on screen after a
+   successful connect. Keep the attribute authoritative. */
+[hidden] { display: none !important; }
+
 html, body {
   height: 100%;
   margin: 0;
@@ -222,8 +229,12 @@ label.inline { display: inline-flex; align-items: center; gap: 6px; font-size: 1
 
 .phone {
   position: relative;
-  width: 100%;
-  max-width: 340px;
+  /* Derive the width from a viewport-bounded height so the whole device pane -
+     screen, nav bar and text input - fits without scrolling on a laptop. The
+     tap mapping reads getBoundingClientRect(), so any size works. */
+  height: min(760px, calc(100vh - 275px));
+  width: auto;
+  max-width: 100%;
   aspect-ratio: 1080 / 2400;
   background: #000;
   border: 1px solid var(--border-strong);
