@@ -41,7 +41,7 @@ services:
 
     environment:
       # --- required -------------------------------------------------------
-      - API_TOKEN=${API_TOKEN:?API_TOKEN must be set - generate with: openssl rand -hex 32}
+      - "API_TOKEN=${API_TOKEN:?set API_TOKEN in the environment - generate one with openssl rand -hex 32}"
       # --- device / emulator ---------------------------------------------
       - EMULATOR_RAM=${EMULATOR_RAM:-4096}
       - EMULATOR_CORES=${EMULATOR_CORES:-4}
