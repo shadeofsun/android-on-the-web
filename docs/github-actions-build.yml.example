@@ -1,0 +1,127 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      android_api:
+        description: "Android API level to bake into the image"
+        required: false
+        default: "34"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Cheap gates first: a lint failure should not cost a multi-GB image build.
+  lint:
+    name: lint (shellcheck + ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+          shellcheck --severity=style --shell=bash scripts/*.sh
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: ruff
+        run: |
+          pip install --quiet ruff==0.8.4
+          ruff check api/
+          ruff format --check api/
+
+      - name: compose syntax
+        run: docker compose -f docker-compose.yml config --quiet
+        env:
+          API_TOKEN: dummy-token-for-validation-only
+          DOMAIN: example.com
+
+  build:
+    name: build and push image
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Android system image is several GB; the default runner disk is tight.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=Android Emulator (Pixel 6) API
+            org.opencontainers.image.description=Headless Pixel 6 Android emulator with a REST API and web console
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64          # the x86_64 system image is not multi-arch
+          push: ${{ github.event_name != 'pull_request' }}
+          load: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          build-args: |
+            ANDROID_API=${{ github.event.inputs.android_api || '34' }}
+            IMAGE_TYPE=google_apis
+            SYSTEM_IMAGE_ABI=x86_64
+
+      - name: Summary
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo "### Image published"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "Pull with: \`docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -5,9 +5,9 @@ the **official Android SDK command-line tools** (no third-party emulator image i
 wrapped), and exposes it two ways: a token-authenticated **REST API** for `adb shell`,
 APK installation, screenshots, input and logcat; and a dependency-free **web console**
 that streams the device screen, forwards taps/swipes/typing, installs APKs by drag &
-drop, and tails logcat live. It is designed to be built once in GitHub Actions, pushed
-to GHCR, and deployed as a **Docker Compose stack on Dokploy** behind Traefik — with
-`/dev/kvm` passed through and **`--privileged` never required**.
+drop, and tails logcat live. It deploys as a **Docker Compose stack on Dokploy** behind
+Traefik, building on the server straight from this repository — with `/dev/kvm` passed
+through and **`--privileged` never required**.
 
 ![Web console](docs/screenshot.png)
 <!-- Placeholder: run the stack, open the UI, and drop a screenshot at docs/screenshot.png -->
@@ -25,6 +25,7 @@ to GHCR, and deployed as a **Docker Compose stack on Dokploy** behind Traefik �
 - [Security](#security)
 - [How it is built](#how-it-is-built)
 - [Troubleshooting](#troubleshooting)
+- [Optional: build in CI instead of on the server](#optional-build-in-ci-instead-of-on-the-server)
 - [Development](#development)
 - [License](#license)
 
@@ -65,6 +66,26 @@ docker run --rm --device /dev/kvm ubuntu:24.04 test -w /dev/kvm && echo "KVM OK"
 >   (GCP nested-virt licence, AWS `*.metal` instances, Azure `Dv3`/`Ev3` families).
 >
 > No amount of Docker flags can create KVM where the hypervisor does not offer it.
+
+### Running inside a VM (ESXi, Proxmox, KVM-on-KVM)
+
+A VM works **only** if the hypervisor exposes nested virtualisation to the guest. You
+need control of the hypervisor for that, which rules out rented VPS instances but not
+your own box:
+
+| Hypervisor | Setting |
+|---|---|
+| **ESXi / vSphere** | VM powered off → *Edit Settings → CPU* → tick **Expose hardware assisted virtualization to the guest OS**. Equivalent `.vmx` line: `vhv.enable = "TRUE"`. |
+| **Proxmox / QEMU** | CPU type `host`, and `kvm_intel nested=1` (or `kvm_amd`) on the Proxmox host. |
+| **Hyper-V** | `Set-VMProcessor -VMName <vm> -ExposeVirtualizationExtensions $true` |
+
+**ESXi gotcha:** nested virtualisation is incompatible with **CPU Hot Add**. If
+*Enable CPU Hot Add* is ticked, the hardware-virtualisation checkbox stays greyed out or
+has no effect. The CPU settings are also editable only while the VM is powered off.
+
+Reserve the guest's memory rather than letting the hypervisor balloon it away — QEMU is
+the first thing to suffer. Expect boot to take noticeably longer than on bare metal, so
+set `BOOT_TIMEOUT=600`.
 
 ### Minimum host resources
 
@@ -121,9 +142,13 @@ open http://localhost:8080        # the web console
 Cold boot on a decent host is typically **60–150 seconds**; the healthcheck
 `start_period` allows 300 s.
 
-To build locally instead of pulling from GHCR, uncomment the `build:` block in
-`docker-compose.yml` and run `docker compose up --build` (expect 15–30 minutes and
-~15 GB of build cache on the first run).
+`docker compose up` builds the image from this repository. The first build downloads the
+Android SDK and system image — expect **20–40 minutes** and **~40 GB of peak disk usage**
+(the finished image is ~8–10 GB; run `docker builder prune` afterwards to reclaim the
+rest). Later builds reuse the layer cache: editing `api/` or `web/` rebuilds in seconds
+because the system-image layer sits below them.
+
+To pull a prebuilt image instead of building, set `IMAGE` to a registry reference.
 
 ---
 
@@ -132,24 +157,27 @@ To build locally instead of pulling from GHCR, uncomment the `build:` block in
 Dokploy is used in **Compose** mode because `devices: /dev/kvm` cannot be expressed in
 Dokploy's simpler "Application" type.
 
-1. **Publish the image.** Push to `main`; `.github/workflows/build.yml` builds and pushes
-   `ghcr.io/shadeofsun/android-on-the-web:latest` plus `sha-<short>` and semver tags. Make the GHCR package
-   public, or add a registry credential in Dokploy → *Settings → Registry*.
+1. **Check the disk first.** The build needs ~40 GB free at its peak:
+
+   ```bash
+   df -h /var/lib/docker
+   ```
 
 2. **Create the project.**
-   Dokploy → **Create Project** → **Compose**.
-   *Provider:* GitHub → select the repository and branch `main`.
+   Dokploy → **Create Project** → **Create Service** → **Compose**.
+   *Provider:* Git → `https://github.com/shadeofsun/android-on-the-web.git`, branch `main`.
    *Compose Path:* `docker-compose.yml`.
+   *Compose Type:* **Docker Compose** — **not** Stack/Swarm. Swarm silently ignores
+   `devices:`, so `/dev/kvm` would never reach the container.
 
 3. **Set the environment.** In the project's **Environment** tab paste:
 
    ```env
    API_TOKEN=<output of: openssl rand -hex 32>
-   IMAGE=ghcr.io/shadeofsun/android-on-the-web:latest
    DOMAIN=android.your-domain.com
    EMULATOR_RAM=4096
    EMULATOR_CORES=4
-   BOOT_TIMEOUT=300
+   BOOT_TIMEOUT=600
    SHELL_MODE=allowlist
    MAX_APK_MB=200
    ```
@@ -195,7 +223,7 @@ Dokploy's simpler "Application" type.
 | Variable | Default | Description |
 |---|---|---|
 | `API_TOKEN` | *(none — required)* | Bearer token for every authenticated endpoint. The service **refuses to start** without it. Minimum 16 chars. |
-| `IMAGE` | `ghcr.io/shadeofsun/android-on-the-web:latest` | Image the compose stack pulls. |
+| `IMAGE` | `android-on-the-web:local` | Tag for the locally built image. Point it at a registry reference to pull a prebuilt image instead of building. |
 | `DOMAIN` | `android.example.com` | Hostname used in the Traefik router rule. |
 | `EMULATOR_RAM` | `4096` | Guest RAM in MB (`-qemu -m`). Must fit inside the container memory limit. |
 | `EMULATOR_CORES` | `4` | Guest vCPUs (`-qemu -smp`). |
@@ -227,7 +255,11 @@ pm, am, input, dumpsys, getprop, setprop, settings, screencap,
 wm, ls, cat, cmd, monkey, logcat, ps, df
 ```
 
-### Build args (`--build-arg`, or the workflow's `build-args`)
+### Build args
+
+Set these in the Dokploy environment (they are wired into `build.args` in
+`docker-compose.yml`) or pass `--build-arg` locally. Changing any of them invalidates the
+multi-GB system-image layer and forces a full rebuild.
 
 | Arg | Default | Description |
 |---|---|---|
@@ -509,8 +541,9 @@ web/                    vanilla HTML/CSS/JS console
 
 **Layer ordering.** The multi-GB system image is installed in its own `RUN` after the
 smaller SDK components, and the Python/app layers come last, so editing `api/main.py`
-rebuilds in seconds rather than re-downloading Android. CI caches with
-`type=gha,mode=max`.
+rebuilds in seconds rather than re-downloading Android. This matters most when Dokploy
+rebuilds on the server: only the layers below your edit are reused, everything above is
+untouched.
 
 **AVD seeding.** The AVD is created at build time into `/opt/avd-template`. A named
 volume mounted at `~/.android/avd/pixel6.avd` would otherwise shadow it, so the
@@ -565,10 +598,16 @@ Check with `docker stats android-emulator`, and `dmesg | grep -i oom` on the hos
 
 ### The image is huge / the build runs out of disk
 
-Expect ~8–10 GB compressed. The GitHub Actions job frees ~14 GB of preinstalled runner
-tooling before building; if it still fails, drop to a smaller system image
-(`ANDROID_API=30`) or use a larger runner. On the server, `docker system prune -af`
-between deployments reclaims old image layers.
+The finished image is ~8–10 GB, and the build peaks around 40 GB with the download cache
+and intermediate layers. Reclaim space with:
+
+```bash
+docker builder prune -f      # build cache only, keeps the image
+docker system prune -af      # also removes unused images - do not run mid-build
+```
+
+If disk is genuinely tight, a smaller system image helps: set `ANDROID_API=30` in the
+environment and redeploy.
 
 ### `502 Bad Gateway` from Traefik
 
@@ -600,10 +639,21 @@ The `avd-data` volume was recreated, or `WIPE_DATA=true` is still set. Check
 
 ---
 
+## Optional: build in CI instead of on the server
+
+If you later want a prebuilt image, `docs/github-actions-build.yml.example` is a ready
+workflow that lints (shellcheck + ruff), builds and pushes to GHCR with `type=gha`
+caching. Copy it to `.github/workflows/build.yml` and push — note that a Personal Access
+Token needs the **`workflow`** scope to create files under `.github/workflows/`. Then set
+`IMAGE=ghcr.io/<owner>/<repo>:latest` in the Dokploy environment and Dokploy will pull
+instead of build.
+
+---
+
 ## Development
 
 ```bash
-# Lint exactly as CI does
+# Lint (the same checks the optional CI workflow runs)
 pip install ruff==0.8.4
 ruff check api/ && ruff format --check api/
 

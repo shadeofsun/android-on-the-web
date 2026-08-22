@@ -3,20 +3,29 @@
 # Deploy as a "Compose" application in Dokploy. Traefik (managed by Dokploy)
 # terminates TLS and routes to port 8080. The adb ports are deliberately NOT
 # published - see README "Security".
+#
+# The image is built ON THE SERVER from this repository. There is no registry
+# to authenticate against and no multi-GB pull; Dokploy clones the repo and
+# runs the build in place. The first build takes 20-40 minutes and needs
+# ~40 GB of free disk; later deploys reuse the layer cache and only rebuild
+# what actually changed (editing api/ or web/ rebuilds in seconds).
+#
+# To pull a prebuilt image instead, set IMAGE in the environment - see
+# docs/github-actions-build.yml.example.
 
 services:
   android:
-    # Built by .github/workflows/build.yml and pulled from GHCR.
-    # Override with IMAGE in the environment / Dokploy UI if you fork this.
-    image: ${IMAGE:-ghcr.io/shadeofsun/android-on-the-web:latest}
+    # Local tag for the image built below. Set IMAGE to a registry reference
+    # if you would rather pull a prebuilt image than build on the server.
+    image: ${IMAGE:-android-on-the-web:local}
 
-    # Optional: build locally instead of pulling.
-    # Uncomment for `docker compose up --build` on a dev machine.
-    # build:
-    #   context: .
-    #   args:
-    #     ANDROID_API: "34"
-    #     IMAGE_TYPE: google_apis
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ANDROID_API: ${ANDROID_API:-34}
+        IMAGE_TYPE: ${IMAGE_TYPE:-google_apis}
+        SYSTEM_IMAGE_ABI: ${SYSTEM_IMAGE_ABI:-x86_64}
 
     container_name: android-emulator
 

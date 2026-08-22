@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 ###############################################################################
 # Android Emulator (Pixel 6) + REST API + Web UI
 #
