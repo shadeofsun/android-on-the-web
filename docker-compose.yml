@@ -1,0 +1,123 @@
+# Android Emulator (Pixel 6) - Dokploy / Docker Compose stack
+#
+# Deploy as a "Compose" application in Dokploy. Traefik (managed by Dokploy)
+# terminates TLS and routes to port 8080. The adb ports are deliberately NOT
+# published - see README "Security".
+
+services:
+  android:
+    # Built by .github/workflows/build.yml and pulled from GHCR.
+    # Override with IMAGE in the environment / Dokploy UI if you fork this.
+    image: ${IMAGE:-ghcr.io/shadeofsun/android-on-the-web:latest}
+
+    # Optional: build locally instead of pulling.
+    # Uncomment for `docker compose up --build` on a dev machine.
+    # build:
+    #   context: .
+    #   args:
+    #     ANDROID_API: "34"
+    #     IMAGE_TYPE: google_apis
+
+    container_name: android-emulator
+
+    # Hardware acceleration. This is the ONLY special privilege required -
+    # do not add --privileged / cap_add.
+    devices:
+      - /dev/kvm:/dev/kvm
+
+    volumes:
+      # Persist userdata so installed apps survive a redeploy.
+      # The image seeds this from /opt/avd-template on first start.
+      - avd-data:/home/androiduser/.android/avd/pixel6.avd
+
+    environment:
+      # --- required -------------------------------------------------------
+      - API_TOKEN=${API_TOKEN:?API_TOKEN must be set - generate with: openssl rand -hex 32}
+      # --- device / emulator ---------------------------------------------
+      - EMULATOR_RAM=${EMULATOR_RAM:-4096}
+      - EMULATOR_CORES=${EMULATOR_CORES:-4}
+      - BOOT_TIMEOUT=${BOOT_TIMEOUT:-300}
+      - WIPE_DATA=${WIPE_DATA:-false}
+      - DISABLE_ANIMATIONS=${DISABLE_ANIMATIONS:-true}
+      # --- API ------------------------------------------------------------
+      - SHELL_MODE=${SHELL_MODE:-allowlist}
+      - SHELL_TIMEOUT=${SHELL_TIMEOUT:-30}
+      - MAX_APK_MB=${MAX_APK_MB:-200}
+      - RATE_LIMIT=${RATE_LIMIT:-60/minute}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+
+    # QEMU wants a decent /dev/shm; the default 64 MB causes hard-to-debug
+    # graphics stalls.
+    shm_size: "2gb"
+
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+    healthcheck:
+      test: ["CMD-SHELL", "[ \"$$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\\r')\" = \"1\" ]"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+
+    networks:
+      - dokploy-network
+
+    labels:
+      # ---------------------------------------------------------------- #
+      # Traefik (Dokploy). Set DOMAIN in the Dokploy environment editor.
+      # ---------------------------------------------------------------- #
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+
+      # HTTPS router
+      - "traefik.http.routers.android.rule=Host(`${DOMAIN:-android.example.com}`)"
+      - "traefik.http.routers.android.entrypoints=websecure"
+      - "traefik.http.routers.android.tls=true"
+      - "traefik.http.routers.android.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.android.service=android"
+
+      # HTTP -> HTTPS
+      - "traefik.http.routers.android-http.rule=Host(`${DOMAIN:-android.example.com}`)"
+      - "traefik.http.routers.android-http.entrypoints=web"
+      - "traefik.http.routers.android-http.middlewares=android-redirect"
+      - "traefik.http.middlewares.android-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.android-redirect.redirectscheme.permanent=true"
+
+      # Only the web port is ever exposed.
+      - "traefik.http.services.android.loadbalancer.server.port=8080"
+
+      # SSE (logcat) must not be buffered or cut short.
+      - "traefik.http.services.android.loadbalancer.responseforwarding.flushinterval=100ms"
+
+      # Allow large APK uploads through Traefik.
+      - "traefik.http.middlewares.android-headers.headers.customrequestheaders.X-Forwarded-Proto=https"
+      - "traefik.http.routers.android.middlewares=android-headers"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    # ---------------------------------------------------------------------
+    # DEBUG ONLY - never uncomment on an internet-facing host.
+    # Binds adb to loopback so you can `adb connect 127.0.0.1:5555` over an
+    # SSH tunnel. See README "Security".
+    # ports:
+    #   - "127.0.0.1:5555:5555"
+    # ---------------------------------------------------------------------
+
+volumes:
+  avd-data:
+
+networks:
+  dokploy-network:
+    external: true

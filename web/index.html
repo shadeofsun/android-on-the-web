@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Pixel 6 Emulator Console</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#129302;</text></svg>">
+</head>
+<body>
+
+<!-- ───────────────────────────────── login ───────────────────────────────── -->
+<div id="login" class="login-shade">
+  <form class="login-card" id="login-form" autocomplete="off">
+    <h1>Pixel&nbsp;6 Console</h1>
+    <p class="muted">
+      Enter the <code>API_TOKEN</code> configured on the server. It is kept in
+      <code>sessionStorage</code> only and is cleared when you close the tab.
+    </p>
+    <label for="token-input">API token</label>
+    <input id="token-input" type="password" placeholder="••••••••••••••••" required
+           spellcheck="false" autocapitalize="off">
+    <label class="checkbox">
+      <input type="checkbox" id="remember-session" checked>
+      <span>Keep for this tab only (sessionStorage)</span>
+    </label>
+    <button type="submit" class="primary">Connect</button>
+    <p id="login-error" class="error" hidden></p>
+  </form>
+</div>
+
+<!-- ───────────────────────────────── shell ───────────────────────────────── -->
+<div id="app" hidden>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="status-dot" title="device state"></span>
+      <strong>Pixel&nbsp;6 Console</strong>
+    </div>
+    <div class="device-meta" id="device-meta">
+      <span class="chip" id="chip-model">—</span>
+      <span class="chip" id="chip-android">—</span>
+      <span class="chip" id="chip-res">—</span>
+      <span class="chip" id="chip-serial">—</span>
+      <span class="chip warn" id="chip-shellmode" hidden>—</span>
+    </div>
+    <div class="topbar-actions">
+      <label class="inline">
+        <span>Poll</span>
+        <select id="poll-interval">
+          <option value="0">off</option>
+          <option value="500">0.5s</option>
+          <option value="1000" selected>1s</option>
+          <option value="2000">2s</option>
+          <option value="5000">5s</option>
+        </select>
+      </label>
+      <button id="btn-reboot" class="ghost danger" title="Reboot the device">Reboot</button>
+      <button id="btn-logout" class="ghost">Lock</button>
+    </div>
+  </header>
+
+  <main class="layout">
+
+    <!-- ── device column ── -->
+    <section class="pane device-pane">
+      <div class="pane-head">
+        <h2>Device</h2>
+        <div class="pane-head-actions">
+          <span class="muted small" id="fps-label">idle</span>
+          <button id="btn-refresh" class="ghost small">Refresh</button>
+        </div>
+      </div>
+
+      <div class="screen-wrap">
+        <div class="phone">
+          <img id="screen" alt="Live device screen" draggable="false">
+          <div id="screen-overlay" class="screen-overlay" hidden>
+            <span class="spinner"></span>
+            <span id="screen-overlay-text">waiting for device…</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="navbar">
+        <button class="navbtn" data-key="KEYCODE_BACK" title="Back">◁</button>
+        <button class="navbtn" data-key="KEYCODE_HOME" title="Home">◯</button>
+        <button class="navbtn" data-key="KEYCODE_APP_SWITCH" title="Recents">▢</button>
+        <button class="navbtn" data-key="KEYCODE_POWER" title="Power">⏻</button>
+        <button class="navbtn" data-key="KEYCODE_VOLUME_UP" title="Volume up">+</button>
+        <button class="navbtn" data-key="KEYCODE_VOLUME_DOWN" title="Volume down">−</button>
+      </div>
+
+      <form class="type-row" id="type-form">
+        <input id="type-input" type="text" placeholder="Type text into the focused field…"
+               spellcheck="false" autocomplete="off">
+        <button type="submit" class="primary small">Send</button>
+        <button type="button" class="ghost small" id="btn-enter" title="KEYCODE_ENTER">⏎</button>
+        <button type="button" class="ghost small" id="btn-del" title="KEYCODE_DEL">⌫</button>
+      </form>
+      <p class="muted small hint">
+        Click the screen to tap · drag to swipe · coordinates are mapped to device space automatically.
+      </p>
+    </section>
+
+    <!-- ── tools column ── -->
+    <section class="pane tools-pane">
+      <nav class="tabs" role="tablist">
+        <button class="tab active" data-tab="shell" role="tab">Shell</button>
+        <button class="tab" data-tab="apps" role="tab">Apps</button>
+        <button class="tab" data-tab="install" role="tab">Install APK</button>
+        <button class="tab" data-tab="logcat" role="tab">Logcat</button>
+      </nav>
+
+      <!-- shell -->
+      <div class="tabpanel active" data-panel="shell">
+        <div id="term" class="terminal" aria-live="polite"></div>
+        <form class="term-input" id="shell-form">
+          <span class="prompt">$</span>
+          <input id="shell-input" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="getprop ro.product.model    (↑/↓ for history)">
+          <button type="submit" class="primary small">Run</button>
+          <button type="button" class="ghost small" id="btn-clear-term">Clear</button>
+        </form>
+      </div>
+
+      <!-- apps -->
+      <div class="tabpanel" data-panel="apps">
+        <div class="row gap">
+          <button id="btn-load-apps" class="primary small">Load packages</button>
+          <label class="checkbox inline">
+            <input type="checkbox" id="include-system">
+            <span>include system</span>
+          </label>
+          <input id="app-filter" class="grow" type="search" placeholder="filter…" spellcheck="false">
+        </div>
+        <ul id="app-list" class="app-list"></ul>
+      </div>
+
+      <!-- install -->
+      <div class="tabpanel" data-panel="install">
+        <div id="dropzone" class="dropzone">
+          <div class="dz-inner">
+            <div class="dz-icon">⬇</div>
+            <p><strong>Drop an .apk here</strong></p>
+            <p class="muted small">or</p>
+            <button type="button" class="ghost small" id="btn-browse">Choose file…</button>
+            <input id="apk-input" type="file" accept=".apk,application/vnd.android.package-archive" hidden>
+          </div>
+        </div>
+        <div id="upload-progress" class="progress" hidden>
+          <div class="progress-label"><span id="upload-name">—</span><span id="upload-pct">0%</span></div>
+          <div class="progress-track"><div class="progress-bar" id="upload-bar"></div></div>
+        </div>
+        <pre id="install-log" class="log-box" hidden></pre>
+      </div>
+
+      <!-- logcat -->
+      <div class="tabpanel" data-panel="logcat">
+        <div class="row gap">
+          <button id="btn-logcat" class="primary small">Start stream</button>
+          <input id="logcat-filter" class="grow" type="text" spellcheck="false"
+                 placeholder="filters, e.g. ActivityManager:I,*:E">
+          <label class="checkbox inline"><input type="checkbox" id="logcat-clear"><span>clear first</span></label>
+          <button id="btn-logcat-clear" class="ghost small" type="button">Clear view</button>
+        </div>
+        <div id="logcat-box" class="log-box grow-box" aria-live="polite"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

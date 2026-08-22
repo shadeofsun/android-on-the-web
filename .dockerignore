@@ -1,0 +1,43 @@
+# VCS
+.git
+.gitignore
+.github
+
+# Local env / secrets - must never enter the build context
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.keystore
+*.jks
+
+# Docs and CI-only assets
+README.md
+LICENSE
+docs/
+*.md
+!api/**/*.md
+
+# Python bytecode / tooling caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Build artefacts and local test data
+*.apk
+*.aab
+dist/
+build/
+*.log
+avd-data/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

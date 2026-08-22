@@ -1,0 +1,29 @@
+# Lint/format configuration for the API service.
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "N",        # pep8-naming
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "A",        # builtins shadowing
+    "C4",       # comprehensions
+    "S",        # bandit
+    "RUF",      # ruff-specific
+    "ANN",      # type annotations
+]
+ignore = [
+    "ANN401",   # Any is deliberate for dynamic adb payloads
+    "B008",     # FastAPI Depends()/File() in defaults is the documented idiom
+    "S101",     # asserts are used only for narrowing types
+]
+
+[lint.per-file-ignores]
+"api/main.py" = ["ARG001"]  # unused `request` params are required by slowapi
+
+[format]
+quote-style = "double"

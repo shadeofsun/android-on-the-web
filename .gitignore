@@ -1,0 +1,41 @@
+# Secrets - never commit
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.keystore
+*.jks
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Android artefacts pulled in for testing
+*.apk
+*.aab
+*.png.tmp
+
+# Emulator / local volumes
+avd-data/
+.android/
+
+# Logs and scratch
+*.log
+tmp/
+scratch/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
